@@ -1,0 +1,426 @@
+# ============================================================================
+# 📊 K6 PERFORMANCE TESTING - CONEXÃO DE SORTE PERFORMANCE INFRASTRUCTURE
+# ============================================================================
+# Configuração completa de testes de performance com K6 para todos os
+# microsserviços conexao-de-sorte-backend-{nome}
+# ============================================================================
+
+# ========================================
+# 🏗️ K6 NAMESPACE E RBAC
+# ========================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: k6-system
+  labels:
+    app.kubernetes.io/name: k6
+    app.kubernetes.io/part-of: conexao-de-sorte-performance
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k6-operator
+  namespace: k6-system
+  labels:
+    app.kubernetes.io/name: k6
+    app.kubernetes.io/part-of: conexao-de-sorte-performance
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k6-operator
+  labels:
+    app.kubernetes.io/name: k6
+    app.kubernetes.io/part-of: conexao-de-sorte-performance
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services", "configmaps", "secrets"]
+  verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "jobs"]
+  verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+- apiGroups: ["k6.io"]
+  resources: ["k6s"]
+  verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k6-operator
+  labels:
+    app.kubernetes.io/name: k6
+    app.kubernetes.io/part-of: conexao-de-sorte-performance
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: k6-operator
+subjects:
+- kind: ServiceAccount
+  name: k6-operator
+  namespace: k6-system
+
+---
+# ========================================
+# 📊 CONFIGMAP COM SCRIPTS K6
+# ========================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: conexao-de-sorte-k6-scripts
+  namespace: k6-system
+  labels:
+    app.kubernetes.io/name: k6-scripts
+    app.kubernetes.io/part-of: conexao-de-sorte-performance
+data:
+  # Script de teste para Autenticação
+  autenticacao-load-test.js: |
+    import http from 'k6/http';
+    import { check, sleep } from 'k6';
+    import { Rate } from 'k6/metrics';
+
+    // Métricas customizadas
+    export let errorRate = new Rate('errors');
+
+    // Configurações do teste
+    export let options = {
+      stages: [
+        { duration: '2m', target: 10 },   // Ramp up
+        { duration: '5m', target: 50 },   // Stay at 50 users
+        { duration: '2m', target: 100 },  // Ramp up to 100 users
+        { duration: '5m', target: 100 },  // Stay at 100 users
+        { duration: '2m', target: 0 },    // Ramp down
+      ],
+      thresholds: {
+        http_req_duration: ['p(95)<500'], // 95% das requests < 500ms
+        http_req_failed: ['rate<0.1'],    // Taxa de erro < 10%
+        errors: ['rate<0.1'],             // Taxa de erro customizada < 10%
+      },
+    };
+
+    const BASE_URL = 'http://conexao-de-sorte-backend-autenticacao.default.svc.cluster.local:8081';
+
+    export default function() {
+      // Teste de health check
+      let healthResponse = http.get(`${BASE_URL}/actuator/health`);
+      check(healthResponse, {
+        'health check status is 200': (r) => r.status === 200,
+        'health check response time < 200ms': (r) => r.timings.duration < 200,
+      }) || errorRate.add(1);
+
+      sleep(1);
+
+      // Teste de login (simulado)
+      let loginPayload = JSON.stringify({
+        username: `user${Math.floor(Math.random() * 1000)}@test.com`,
+        password: 'testpassword123'
+      });
+
+      let loginParams = {
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      };
+
+      let loginResponse = http.post(`${BASE_URL}/api/auth/login`, loginPayload, loginParams);
+      check(loginResponse, {
+        'login status is 200 or 401': (r) => r.status === 200 || r.status === 401,
+        'login response time < 1000ms': (r) => r.timings.duration < 1000,
+      }) || errorRate.add(1);
+
+      sleep(2);
+    }
+
+  # Script de teste para Gateway
+  gateway-load-test.js: |
+    import http from 'k6/http';
+    import { check, sleep } from 'k6';
+    import { Rate } from 'k6/metrics';
+
+    export let errorRate = new Rate('errors');
+
+    export let options = {
+      stages: [
+        { duration: '1m', target: 20 },
+        { duration: '3m', target: 100 },
+        { duration: '1m', target: 200 },
+        { duration: '3m', target: 200 },
+        { duration: '2m', target: 0 },
+      ],
+      thresholds: {
+        http_req_duration: ['p(95)<1000'],
+        http_req_failed: ['rate<0.05'],
+        errors: ['rate<0.05'],
+      },
+    };
+
+    const BASE_URL = 'http://conexao-de-sorte-backend-gateway.default.svc.cluster.local:8086';
+
+    export default function() {
+      // Teste de roteamento através do gateway
+      let routes = [
+        '/api/auth/health',
+        '/api/financial/health',
+        '/api/results/health',
+        '/api/chat/health'
+      ];
+
+      let route = routes[Math.floor(Math.random() * routes.length)];
+      let response = http.get(`${BASE_URL}${route}`);
+      
+      check(response, {
+        'gateway routing status is 200 or 404': (r) => r.status === 200 || r.status === 404,
+        'gateway response time < 2000ms': (r) => r.timings.duration < 2000,
+      }) || errorRate.add(1);
+
+      sleep(1);
+    }
+
+  # Script de teste para Financeiro (mais conservador)
+  financeiro-load-test.js: |
+    import http from 'k6/http';
+    import { check, sleep } from 'k6';
+    import { Rate } from 'k6/metrics';
+
+    export let errorRate = new Rate('errors');
+
+    export let options = {
+      stages: [
+        { duration: '3m', target: 5 },    // Ramp up lento
+        { duration: '5m', target: 20 },   // Carga moderada
+        { duration: '2m', target: 0 },    // Ramp down
+      ],
+      thresholds: {
+        http_req_duration: ['p(95)<2000'], // Mais tolerante para serviços críticos
+        http_req_failed: ['rate<0.02'],    // Taxa de erro muito baixa
+        errors: ['rate<0.02'],
+      },
+    };
+
+    const BASE_URL = 'http://conexao-de-sorte-backend-financeiro.default.svc.cluster.local:8082';
+
+    export default function() {
+      // Apenas health checks para serviços financeiros críticos
+      let healthResponse = http.get(`${BASE_URL}/actuator/health`);
+      check(healthResponse, {
+        'financial health status is 200': (r) => r.status === 200,
+        'financial health response time < 500ms': (r) => r.timings.duration < 500,
+      }) || errorRate.add(1);
+
+      sleep(3); // Intervalo maior entre requests
+    }
+
+---
+# ========================================
+# 🎯 K6 TEST RUNS PARA CADA SERVIÇO
+# ========================================
+# Nota: Estes recursos K6 são aplicados sob demanda via script
+# Para executar: kubectl apply -f k6-test-{service}.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: conexao-de-sorte-backend-autenticacao-load-test
+  namespace: k6-system
+  labels:
+    app.kubernetes.io/name: conexao-de-sorte-backend-autenticacao-test
+    app.kubernetes.io/part-of: conexao-de-sorte-performance
+spec:
+  parallelism: 4
+  script:
+    configMap:
+      name: conexao-de-sorte-k6-scripts
+      file: autenticacao-load-test.js
+  separate: false
+  runner:
+    image: grafana/k6:latest
+    resources:
+      limits:
+        cpu: 500m
+        memory: 512Mi
+      requests:
+        cpu: 200m
+        memory: 256Mi
+    env:
+    - name: K6_PROMETHEUS_RW_SERVER_URL
+      value: "http://prometheus.istio-system.svc.cluster.local:9090/api/v1/write"
+    - name: K6_PROMETHEUS_RW_TREND_AS_NATIVE_HISTOGRAM
+      value: "true"
+
+---
+apiVersion: k6.io/v1alpha1
+kind: K6
+metadata:
+  name: conexao-de-sorte-backend-gateway-load-test
+  namespace: k6-system
+  labels:
+    app.kubernetes.io/name: conexao-de-sorte-backend-gateway-test
+    app.kubernetes.io/part-of: conexao-de-sorte-performance
+spec:
+  parallelism: 6
+  script:
+    configMap:
+      name: conexao-de-sorte-k6-scripts
+      file: gateway-load-test.js
+  separate: false
+  runner:
+    image: grafana/k6:latest
+    resources:
+      limits:
+        cpu: 1000m
+        memory: 1Gi
+      requests:
+        cpu: 300m
+        memory: 512Mi
+    env:
+    - name: K6_PROMETHEUS_RW_SERVER_URL
+      value: "http://prometheus.istio-system.svc.cluster.local:9090/api/v1/write"
+
+---
+apiVersion: k6.io/v1alpha1
+kind: K6
+metadata:
+  name: conexao-de-sorte-backend-financeiro-load-test
+  namespace: k6-system
+  labels:
+    app.kubernetes.io/name: conexao-de-sorte-backend-financeiro-test
+    app.kubernetes.io/part-of: conexao-de-sorte-performance
+spec:
+  parallelism: 2  # Menos paralelismo para serviços críticos
+  script:
+    configMap:
+      name: conexao-de-sorte-k6-scripts
+      file: financeiro-load-test.js
+  separate: false
+  runner:
+    image: grafana/k6:latest
+    resources:
+      limits:
+        cpu: 300m
+        memory: 256Mi
+      requests:
+        cpu: 100m
+        memory: 128Mi
+    env:
+    - name: K6_PROMETHEUS_RW_SERVER_URL
+      value: "http://prometheus.istio-system.svc.cluster.local:9090/api/v1/write"
+
+---
+# ========================================
+# 📊 CRONJOB PARA TESTES AUTOMATIZADOS
+# ========================================
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: conexao-de-sorte-performance-tests
+  namespace: k6-system
+  labels:
+    app.kubernetes.io/name: conexao-de-sorte-performance-cron
+    app.kubernetes.io/part-of: conexao-de-sorte-performance
+spec:
+  # Executar testes de performance diariamente às 2h da manhã
+  schedule: "0 2 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: k6-operator
+          containers:
+          - name: k6-runner
+            image: grafana/k6:latest
+            command:
+            - /bin/sh
+            - -c
+            - |
+              echo "🚀 Iniciando testes de performance automatizados..."
+              
+              # Executar teste do Gateway
+              echo "📊 Testando Gateway..."
+              k6 run --out prometheus-rw=http://prometheus.istio-system.svc.cluster.local:9090/api/v1/write /scripts/gateway-load-test.js
+              
+              # Aguardar intervalo
+              sleep 300
+              
+              # Executar teste de Autenticação
+              echo "🔐 Testando Autenticação..."
+              k6 run --out prometheus-rw=http://prometheus.istio-system.svc.cluster.local:9090/api/v1/write /scripts/autenticacao-load-test.js
+              
+              # Aguardar intervalo
+              sleep 300
+              
+              # Executar teste Financeiro (apenas em dias úteis)
+              if [ $(date +%u) -le 5 ]; then
+                echo "💰 Testando Financeiro..."
+                k6 run --out prometheus-rw=http://prometheus.istio-system.svc.cluster.local:9090/api/v1/write /scripts/financeiro-load-test.js
+              fi
+              
+              echo "✅ Testes de performance concluídos"
+            volumeMounts:
+            - name: k6-scripts
+              mountPath: /scripts
+            resources:
+              limits:
+                cpu: 1000m
+                memory: 1Gi
+              requests:
+                cpu: 200m
+                memory: 256Mi
+          volumes:
+          - name: k6-scripts
+            configMap:
+              name: conexao-de-sorte-k6-scripts
+          restartPolicy: OnFailure
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+
+---
+# ========================================
+# 📈 PERFORMANCE MONITORING
+# ========================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: conexao-de-sorte-performance-monitoring
+  namespace: k6-system
+  labels:
+    app.kubernetes.io/name: conexao-de-sorte-performance-monitoring
+    app.kubernetes.io/part-of: conexao-de-sorte-performance
+data:
+  prometheus-rules.yaml: |
+    groups:
+    - name: conexao-de-sorte-performance-rules
+      rules:
+      - alert: HighResponseTime
+        expr: |
+          (
+            rate(k6_http_req_duration_sum[5m]) / 
+            rate(k6_http_req_duration_count[5m])
+          ) > 1000
+        for: 2m
+        labels:
+          severity: warning
+          service: "{{ $labels.name }}"
+        annotations:
+          summary: "High response time detected"
+          description: "Service {{ $labels.name }} has average response time of {{ $value }}ms"
+          
+      - alert: HighErrorRate
+        expr: rate(k6_http_req_failed_total[5m]) > 0.1
+        for: 1m
+        labels:
+          severity: critical
+          service: "{{ $labels.name }}"
+        annotations:
+          summary: "High error rate in performance tests"
+          description: "Service {{ $labels.name }} has error rate of {{ $value | humanizePercentage }}"
+          
+      - alert: PerformanceTestFailed
+        expr: increase(k6_test_failed_total[1h]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: "{{ $labels.name }}"
+        annotations:
+          summary: "Performance test failed"
+          description: "Performance test for {{ $labels.name }} failed"
